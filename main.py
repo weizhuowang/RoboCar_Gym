@@ -1,5 +1,5 @@
 import gym
-import gym_quadrotor
+import robo_gym
 import numpy as np
 
 import os
@@ -8,7 +8,7 @@ import time
 import math
 import matplotlib.pyplot as plt
 
-env = gym.make('quad-v0')
+env = gym.make('racecar-v0')
 
 start_new = False
 if start_new:
