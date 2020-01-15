@@ -12,9 +12,9 @@ import pickle
 import math
 import time
 import copy
+from scipy.stats import rankdata
 
-# device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-device = torch.device("cpu")
+# The only difference from quadrotor is the reward function
 
 def normalize_weight(size):
 	v = 1. / np.sqrt(size[0])
@@ -23,6 +23,21 @@ def normalize_weight(size):
 def  gelu_approx(x):
 	return torch.sigmoid(1.702*x)*x
 
+def compute_td_err(agent, s, a, r, s1):
+		a  = Variable(torch.from_numpy(a))
+		s  = Variable(torch.from_numpy(s))
+		s1 = Variable(torch.from_numpy(s1))
+
+		if agent.gpuid >= 0:
+			s  = s.cuda()
+			a  = a.cuda()
+			s1 = s1.cuda()
+		
+		a1 = agent.target_actor.forward(s1).detach()
+		next_val = torch.squeeze(agent.target_critic.forward(s1, a1).detach())
+		td_err = r + agent.gamma*next_val.cpu().numpy() - torch.squeeze(agent.critic.forward(s, a).detach()).cpu().numpy()
+
+		return td_err
 
 class Critic(nn.Module):
 
@@ -49,19 +64,16 @@ class Critic(nn.Module):
 		self.fc3 = nn.Linear(128,1)
 		self.fc3.weight.data.uniform_(-self.EPS,self.EPS)
 
-
-		self.fcs1.to(device)
-		self.fcs2.to(device)
-		self.fca1.to(device)
-		self.fc2.to(device)
-		self.fc3.to(device)
-
 	def forward(self, state, action):
-		state = state.to(device)
-		action = action.to(device)
+
 		s1 =  F.relu(self.fcs1(state))
 		s2 =  F.relu(self.fcs2(s1))
 		a1 =  F.relu(self.fca1(action))
+
+		if s2.dim() == 1:
+			s2 = s2.unsqueeze(0)
+			a1 = a1.unsqueeze(0)
+
 		x = torch.cat((s2,a1),dim=1)
 
 		x =  F.relu(self.fc2(x))
@@ -93,13 +105,8 @@ class Actor(nn.Module):
 		self.fc4 = nn.Linear(64,action_dim)
 		self.fc4.weight.data.uniform_(-self.EPS,self.EPS)
 
-		self.fc1.to(device)
-		self.fc2.to(device)
-		self.fc3.to(device)
-		self.fc4.to(device)
-
 	def forward(self, state):
-		state = state.to(device)
+
 		x =  F.relu(self.fc1(state))
 		x =  F.relu(self.fc2(x))
 		x =  F.relu(self.fc3(x))
@@ -151,16 +158,15 @@ class OUNoise:
 		x = self.state
 		dx = self.theta * (self.mu - x) + self.sigma * np.random.randn(len(x))
 		self.state = x + dx
-		return self.state
+		return np.float32(self.state)
 
-class Memory:
+class Memory1:
 	def __init__(self, size):
 		if os.path.exists('model/memory_list.p'):
-
 		    self.memory_list = pickle.load(open('model/memory_list.p','rb'))
 		else:
 			self.memory_list = deque(maxlen=size)
-
+		
 	def sample(self, count):
 
 		batch = []
@@ -172,7 +178,6 @@ class Memory:
 		a_arr = np.float32([arr[1] for arr in batch])
 		r_arr = np.float32([arr[2] for arr in batch])
 		next_s_arr = np.float32([arr[3] for arr in batch])
-
 		return s_arr, a_arr, r_arr, next_s_arr
 
 	def add(self, s, a, r, s1):
@@ -183,11 +188,137 @@ class Memory:
 	def save(self):
 		pickle.dump(self.memory_list, open('model/memory_list.p','wb'))
 
+# Calculate TD error at sample
+class Memory:
+	def __init__(self, size):
+		if os.path.exists('model/memory_list.p'):
+		    [self.memory_list,self.write_idx,self.size,self.full_replay] = pickle.load(open('model/memory_list.p','rb'))
+		else:
+			self.memory_list = np.zeros((size,4),dtype=object)
+			self.write_idx = 0
+			self.size = size
+			self.full_replay = False
+		
+	def sample(self, count):
 
+		if self.full_replay:
+			batch = np.random.choice(self.size, size=count, replace=False)
+		else:
+			if self.write_idx <= count:
+				batch = np.arange(0,self.write_idx)
+			else:
+				batch = np.random.choice(self.write_idx, size=count, replace=False)
+
+		s_arr = np.float32(np.stack(self.memory_list[batch,0],axis=0))
+		a_arr = np.float32(np.stack(self.memory_list[batch,1],axis=0))
+		r_arr = np.float32(np.stack(self.memory_list[batch,2],axis=0))
+		next_s_arr = np.float32(np.stack(self.memory_list[batch,3],axis=0))
+
+		return s_arr, a_arr, r_arr, next_s_arr
+
+	def PER_sample(self, count, agent):
+
+		if self.full_replay:
+			s  = np.float32(np.stack(self.memory_list[:,0],axis=0))
+			a  = np.float32(np.stack(self.memory_list[:,1],axis=0))
+			r  = np.float32(np.stack(self.memory_list[:,2],axis=0))
+			s1 = np.float32(np.stack(self.memory_list[:,3],axis=0))
+			td_err = abs(compute_td_err(agent, s, a, r, s1))
+			D = 1.0/(td_err.size-rankdata(td_err)+1) # rankdata start from min
+			P = D/sum(D)
+			batch = np.random.choice(self.size, size=count, replace=False,p = P)
+		else:
+			if self.write_idx < count:
+				batch = np.arange(0,self.write_idx)
+			else:
+				batch = np.random.choice(self.write_idx, size=count, replace=False)
+
+		s_arr = np.float32(np.stack(self.memory_list[batch,0],axis=0))
+		a_arr = np.float32(np.stack(self.memory_list[batch,1],axis=0))
+		r_arr = np.float32(np.stack(self.memory_list[batch,2],axis=0))
+		next_s_arr = np.float32(np.stack(self.memory_list[batch,3],axis=0))
+
+		return s_arr, a_arr, r_arr, next_s_arr
+
+
+	def add(self, s, a, r, s1):
+
+		transition = np.array([s,a,r,s1],dtype=object)
+		self.memory_list[self.write_idx,:] = transition
+		self.write_idx += 1
+		self.write_idx = self.write_idx % self.size
+		if self.write_idx == 0:
+			self.full_replay = self.full_replay or True
+
+	def save(self):
+		pickle.dump([self.memory_list,self.write_idx,self.size,self.full_replay], open('model/memory_list.p','wb'))
+
+# Calculate TD Error at add
+class Memory3:
+	def __init__(self, size):
+		if os.path.exists('model/memory_list.p'):
+		    [self.memory_list,self.write_idx,self.size,self.full_replay] = pickle.load(open('model/memory_list.p','rb'))
+		else:
+			self.memory_list = np.zeros((size,5),dtype=object)
+			self.write_idx = 0
+			self.size = size
+			self.full_replay = False
+		
+	def sample(self, count):
+
+		if self.full_replay:
+			batch = np.random.choice(self.size, size=count, replace=False)
+		else:
+			if self.write_idx < count:
+				batch = np.arange(0,self.write_idx)
+			else:
+				batch = np.random.choice(self.write_idx, size=count, replace=False)
+
+		s_arr = np.float32(np.stack(self.memory_list[batch,0],axis=0))
+		a_arr = np.float32(np.stack(self.memory_list[batch,1],axis=0))
+		r_arr = np.float32(np.stack(self.memory_list[batch,2],axis=0))
+		next_s_arr = np.float32(np.stack(self.memory_list[batch,3],axis=0))
+
+		return s_arr, a_arr, r_arr, next_s_arr
+
+	def PER_sample(self, count, agent):
+
+		td_arr = np.float32(np.stack(self.memory_list[:,4],axis=0))
+		if self.full_replay:
+			td_err = abs(td_arr)
+			D = 1.0/(td_err.size-rankdata(td_err)+1) # rankdata start from min
+			P = D/sum(D)
+			batch = np.random.choice(self.size, size=count, replace=False,p = P)
+		else:
+			if self.write_idx < count:
+				batch = np.arange(0,self.write_idx)
+			else:
+				batch = np.random.choice(self.write_idx, size=count, replace=False)
+
+		s_arr = np.float32(np.stack(self.memory_list[batch,0],axis=0))
+		a_arr = np.float32(np.stack(self.memory_list[batch,1],axis=0))
+		r_arr = np.float32(np.stack(self.memory_list[batch,2],axis=0))
+		next_s_arr = np.float32(np.stack(self.memory_list[batch,3],axis=0))
+
+		return s_arr, a_arr, r_arr, next_s_arr
+
+
+	def add(self, s, a, r, s1, td_err):
+
+		transition = np.array([s,a,r,s1,td_err],dtype=object)
+		self.memory_list[self.write_idx,:] = transition
+		self.write_idx += 1
+		self.write_idx = self.write_idx % self.size
+		if self.write_idx == 0:
+			self.full_replay = self.full_replay or True
+
+	def save(self):
+		pickle.dump([self.memory_list,self.write_idx,self.size,self.full_replay], open('model/memory_list.p','wb'))
 
 class Agent:
-	def __init__(self, state_size, action_size, max_action, memory):
-		print(device)
+	def __init__(self, state_size, action_size, max_action, memory, gpuid):
+		self.gpuid = gpuid
+
 		self.state_size = state_size
 		self.action_size = action_size
 		self.max_action = max_action
@@ -196,9 +327,10 @@ class Agent:
 		self.learning_rate_a = 0.0001
 		self.learning_rate_c = 10*self.learning_rate_a
 
-		self.noiseMachine = NoiseGenerator(self.action_size,self.max_action)
+		# self.noiseMachine = NoiseGenerator(self.action_size,self.max_action)
 		self.noiseMachine = OUNoise(self.action_size,0,0.15,0.2,self.max_action)
 		self.memory = memory
+		self.gpuid = gpuid
 
 		self.loadAllNetwork()
 		self.optim_a = torch.optim.Adam(self.actor.parameters(),self.learning_rate_a)
@@ -207,6 +339,7 @@ class Agent:
 		self.copy(self.target_critic, self.critic)
 
 	def loadAllNetwork(self):
+		# Either load network if aviliable or creat new network to train
 		if os.path.exists('model/quadrotor_actor.pkl'):
 		    self.actor = torch.load('model/quadrotor_actor.pkl')
 		    print('Actor Model loaded')
@@ -230,6 +363,12 @@ class Agent:
 		    print('Target Critic Model loaded')
 		else:
 		    self.target_critic = Critic(self.state_size, self.action_size)
+		# https://github.com/dgriff777/rl_a3c_pytorch Cuda checked against this repo
+		if self.gpuid >= 0:
+				self.actor  = self.actor.cuda()
+				self.critic = self.critic.cuda()
+				self.target_actor  = self.target_actor.cuda()
+				self.target_critic = self.target_critic.cuda()
 
 	def saveNetwork(self,isbest):
 		if isbest:
@@ -242,14 +381,20 @@ class Agent:
 
 	def use_action(self,state):
 		state = Variable(torch.from_numpy(state))
+		if self.gpuid >= 0:
+				state = state.cuda()
+		
 		action = self.target_actor.forward(state).detach()
-		return action.cpu().numpy()#action.data.numpy()
+		return np.float32(action.cpu().numpy())#action.data.numpy()
 
 
 	def get_action(self, state):
 		state = Variable(torch.from_numpy(state))
+		if self.gpuid >= 0:
+			state = state.cuda()
+		
 		action = self.actor.forward(state).detach()
-		return action.cpu().numpy() + self.noiseMachine.randomNoise()
+		return (action.cpu().numpy()) + self.noiseMachine.randomNoise()
 
 	def copy(self,target, source):
 		for target_param, source_param in zip(target.parameters(), source.parameters()):
@@ -263,27 +408,29 @@ class Agent:
 			)
 
 	def rewardFunc(self,state,action):
-		x = state[0]
-		y = state[2]
-		z = state[4]
-		phi_   = state[6]
-		theta_ = state[7]
-		psi_   = state[8]
+		x  = state[0]
+		vx = state[1]
+		y  = state[2]
+		vy = state[3]
+		yaw = state[4]
 		reward = 0
 
-		# You Nei Weier Reward
-		distance = math.sqrt((x**2)+(y**2)+(z**2))
-		o_error = abs(phi_)+abs(theta_)+abs(psi_)
-		if distance > 3:
-			reward -= (distance + 100*o_error)
+		# x,vx,y,vy,yaw,yaw rate
+		
+		### You Nei Weier Reward
+		distance = math.sqrt((x**2)+(y**2))
+		o_error = abs(yaw)+abs(vx)+abs(vy)
+		if distance > 1:
+			reward -= (distance + 1*o_error)
 
 		else:
-			reward -= (0.01*distance + 10*o_error)
+			reward -= (0.1*distance + 10*o_error)
 
+		print('loc1',vx,vy,yaw)
 		# if distance < 1:
 		# 	reward = 2000
 
-		# Ken reward
+		### Ken reward
 		# agent_pos = np.array([x,y,z],dtype=float)
 		# des_pos   = np.array([0,0,0],dtype=float)
 		# distance  = np.linalg.norm(agent_pos-des_pos)
@@ -292,11 +439,12 @@ class Agent:
 		# xdes 	   = np.array([0,0,0,0,0,0],dtype=float)
 		# xcurr 	   = np.array([x,y,z,phi_,theta_,psi_],dtype=float)
 		# reward     = np.inner(weight_mat,abs(xdes-xcurr))
-		if distance < 10:
-			reward = reward - 0.5*min(max(x,-10),10)**2 + 30
-			reward = reward - 0.5*min(max(y,-10),10)**2 + 30
+		if distance < 5:
+			reward = reward - 0.5*min(max(x,-3),3)**2 + 30
+			reward = reward - 0.5*min(max(y,-3),3)**2 + 30
 
-		reward -= abs(np.sum(action[1:]))*0.5
+		reward -= abs(np.sum(action))*0.1
+
 		# if distance < 2:
 		# 	reward += 30.0/distance
 		# else:
@@ -323,22 +471,27 @@ class Agent:
 	def train(self,train_all):
 		
 		s,a,r,ns = self.memory.sample(self.batch_size)
+		# s,a,r,ns = self.memory.PER_sample(self.batch_size,self)
 
 		s = Variable(torch.from_numpy(s))
-		s = s.to(device)
 		a = Variable(torch.from_numpy(a))
-		a = a.to(device)
 		r = Variable(torch.from_numpy(r))
-		r = r.to(device)
 		ns = Variable(torch.from_numpy(ns))
-		ns = ns.to(device)
 
+		if self.gpuid >= 0:
+			s = s.cuda()
+			a = a.cuda()
+			r = r.cuda()
+			ns = ns.cuda()
 
 		a2 = self.target_actor.forward(ns).detach()
 		next_val = torch.squeeze(self.target_critic.forward(ns, a2).detach())
 
 		y_expected = r + self.gamma*next_val
 		y_predicted = torch.squeeze(self.critic.forward(s, a)) # 0.001
+
+		# td_err = y_expected-y_predicted
+		# np.matmul(td_err*w_arr)/self.batch_size
 
 		# compute critic loss, update the critic
 		loss_critic = F.smooth_l1_loss(y_predicted, y_expected)
