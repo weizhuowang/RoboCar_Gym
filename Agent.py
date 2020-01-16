@@ -409,10 +409,10 @@ class Agent:
 
 	def rewardFunc(self,state,action):
 		x  = state[0]
-		vx = state[1]
-		y  = state[2]
+		vx = state[3]
+		y  = state[1]
 		vy = state[3]
-		yaw = state[4]
+		yaw = state[2]
 		reward = 0
 
 		# x,vx,y,vy,yaw,yaw rate
@@ -424,9 +424,8 @@ class Agent:
 			reward -= (distance + 1*o_error)
 
 		else:
-			reward -= (0.1*distance + 10*o_error)
+			reward -= (0.1*distance + 1*o_error)
 
-		print('loc1',vx,vy,yaw)
 		# if distance < 1:
 		# 	reward = 2000
 

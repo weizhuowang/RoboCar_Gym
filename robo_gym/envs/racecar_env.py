@@ -40,8 +40,8 @@ class RaceCarEnv(gym.Env):
         self.gravity = 9.81
 
         self.car = None
-        self.state = np.zeros(6)
-        self.input = np.zeros(4)
+        self.state = np.zeros(4) # x y psi v
+        self.input = np.zeros(2) # d_f, a
         self.motor_mass = 2
         self.car_mass = self.motor_mass
 
@@ -64,10 +64,10 @@ class RaceCarEnv(gym.Env):
         self.viewer = None
 
         #define limiting space
-        high = np.array([10,10,10,10,5,5])
+        high = np.array([100,100,99999,100])
         low = -high
         self.observation_space = spaces.Box(low=low, high=high, dtype=np.float32)
-        self.action_space = spaces.Box(low=np.array([-0.1,-0.01]),high=np.array([0.1,0.01]),dtype=np.float32)
+        self.action_space = spaces.Box(low=np.array([-0.1,-5]),high=np.array([0.1,5]),dtype=np.float32)
 
     def setrender(self,renderflg):
         self.renderflg = renderflg
@@ -80,15 +80,16 @@ class RaceCarEnv(gym.Env):
     def step(self, action):
         self.input = action
         
-        state_augmented = np.append(self.state, self.input)
-        sol = scipy.integrate.solve_ivp(self._dsdt, [0, self.dt], state_augmented)
+        # state_augmented = np.append(self.state, self.input)
+        # sol = scipy.integrate.solve_ivp(self._dsdt, [0, self.dt], state_augmented)
 
-        ns = sol.y[:,-1]
-        self.state = ns[:-2]
+        # ns = sol.y[:,-1]
+        # self.state = ns[:-2]
 
+        self.state = self.f_KinBkMdl(self.state,self.input,[self.lf,self.lr], self.dt)
         done = False
         #if the car is going out of bounds, terminate this episode
-        if max(np.absolute(self.state[[0,2]])) > 10:
+        if max(np.absolute(self.state[[0,1]])) > 10:
             print(self.state)
             done = True
         return self.state,done
@@ -97,7 +98,7 @@ class RaceCarEnv(gym.Env):
 
     def reset(self):
         # self.state = np.array([0,0,0,0,0,0,0,0,0,0,0,0],dtype=np.float32)
-        self.state = np.array([-5+10*random(),0,-5+10*random(),0,-0.5+random(),0],dtype=np.float32)
+        self.state = np.array([-2+4*random(),-2+4*random(),0,0],dtype=np.float32)
         if self.renderflg:
             self.render()
         return self.state
@@ -141,10 +142,10 @@ class RaceCarEnv(gym.Env):
 
         car_w,car_l,car_h = 0.132, 0.26/0.6, 0.2
         wheel_r,wheel_h   = 0.095,0.035
-        self.car.pos  = vector(self.state[0],0,self.state[2])
-        self.car.axis = vector(math.cos(self.state[4]),0.000001,math.sin(self.state[4]))
-        self.frontwheel.pos  = vector(self.state[0],-0.03,self.state[2])+0.6*car_l/2.0*self.car.axis
-        self.frontwheel.axis = vector(math.cos(self.state[4]+self.input[1]),0.000001,math.sin(self.state[4]+self.input[1]))
+        self.car.pos  = vector(self.state[0],0,self.state[1])
+        self.car.axis = vector(math.cos(self.state[2]),0.000001,math.sin(self.state[2]))
+        self.frontwheel.pos  = vector(self.state[0],-0.03,self.state[1])+0.6*car_l/2.0*self.car.axis
+        self.frontwheel.axis = vector(math.cos(self.state[2]+self.input[0]),0.000001,math.sin(self.state[2]+self.input[0]))
 
         self.pointer.pos  = self.car.pos
         self.pointer.axis = self.car.axis
@@ -178,6 +179,29 @@ class RaceCarEnv(gym.Env):
         yawdd = (1/self.moi)*(self.lf*Fyr*math.cos(delta)-self.lf*Fyr)
 
         return xd,xdd,yd,ydd,yawd,yawdd,0,0
+
+    def f_KinBkMdl(self,z,u,vhMdl, dt):
+        # get states / inputs
+        x       = z[0]
+        y       = z[1]
+        psi     = z[2]
+        v       = z[3]
+        d_f     = u[0]
+        a       = u[1]
+
+        # extract parameters
+        (L_a, L_b)             = vhMdl
+
+        # compute slip angle
+        bta         = np.arctan( L_a / (L_a + L_b) * np.tan(d_f) )
+
+        # compute next state
+        x_next      = x + dt*( v*np.cos(psi + bta) )
+        y_next      = y + dt*( v*np.sin(psi + bta) )
+        psi_next    = psi + dt*v/L_b*np.sin(bta)
+        v_next      = v + dt*a
+
+        return np.array([x_next, y_next, psi_next, v_next])
 
     def bound(self,x,m,M):
         return min(max(x, m), M)

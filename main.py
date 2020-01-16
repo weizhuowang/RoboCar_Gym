@@ -67,7 +67,7 @@ nonoise = False
 maxreward = -10000000
 
 env.setrender(render)
-env.setdt(0.005)
+env.setdt(0.02)
 
 # Plot Init
 fig = plt.figure(figsize=(18,5))
@@ -112,7 +112,6 @@ while run:
 
         n_state, done = env.step(action) # input [torque steer]
         reward = agent.rewardFunc(n_state,action)
-        print(reward)
         #reward in this episode
         curr_reward += reward
 
